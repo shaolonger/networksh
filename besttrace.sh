@@ -5,7 +5,7 @@
 # - 移除 管道执行远程 sh 远程脚本执行
 # - 内置 NextTrace 二进制下载逻辑，仅下载二进制，不执行远程 sh
 # - 使用 mktemp 临时文件、输入校验、HTTPS URL 校验、可选 SHA256 校验
-# - 自动处理 NextTrace 权限：root/capabilities 用 ICMP，普通用户自动降级 TCP
+# - 自动处理 NextTrace 权限：root/capabilities 或 sudo setcap；不再误判 TCP 可绕过权限
 #
 # 安全模式建议：
 #   1) 已安装 nexttrace：直接运行本脚本，不会下载任何内容。
@@ -51,7 +51,7 @@ NEXTTRACE_SHA256="${NEXTTRACE_SHA256:-}"
 BESTTRACE_NO_INSTALL="${BESTTRACE_NO_INSTALL:-0}"
 
 # 路由测试协议模式：auto|icmp|tcp|udp。
-# auto：有 root/capabilities 时用 ICMP；否则自动退回 TCP:443，避免普通用户权限失败。
+# auto：默认 ICMP。注意：NextTrace 的 TCP/UDP traceroute 仍需要 raw socket/capabilities。
 BESTTRACE_TRACE_MODE="${BESTTRACE_TRACE_MODE:-auto}"
 BESTTRACE_TCP_PORT="${BESTTRACE_TCP_PORT:-443}"
 BESTTRACE_UDP_PORT="${BESTTRACE_UDP_PORT:-33494}"
@@ -66,6 +66,7 @@ ROWS_CM=()
 ROWS_EDU=()
 ROWS_OTHER=()
 TRACE_ARGS=()
+NEXTTRACE_PRIVILEGE_OK=0
 TRACE_MODE_EFFECTIVE=""
 
 # ---------- 基础工具 ----------
@@ -513,23 +514,28 @@ is_valid_target() {
 }
 
 
-can_use_icmp_mode() {
-    # root 运行时可以直接使用 ICMP。
+has_nexttrace_capabilities() {
+    # 普通用户运行 NextTrace 需要二进制具备 Linux capabilities。
+    # TCP/UDP 模式也仍会监听 ICMP Time Exceeded，因此同样需要 raw socket 权限。
+    command_exists getcap || return 1
+    [[ -n "${NEXTTRACE_CMD:-}" && -e "$NEXTTRACE_CMD" ]] || return 1
+
+    local caps
+    caps="$(getcap "$NEXTTRACE_CMD" 2>/dev/null || true)"
+    [[ "$caps" == *cap_net_raw* && "$caps" == *cap_net_admin* ]]
+}
+
+can_use_raw_socket_nexttrace() {
     if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
         return 0
     fi
-
-    # 普通用户需要二进制具备 Linux capabilities。
-    if command_exists getcap && [[ -n "${NEXTTRACE_CMD:-}" ]] && [[ -e "$NEXTTRACE_CMD" ]]; then
-        local caps
-        caps="$(getcap "$NEXTTRACE_CMD" 2>/dev/null || true)"
-        [[ "$caps" == *cap_net_raw* && "$caps" == *cap_net_admin* ]] && return 0
+    if [[ "$NEXTTRACE_PRIVILEGE_OK" = "1" ]]; then
+        return 0
     fi
-
-    return 1
+    has_nexttrace_capabilities
 }
 
-try_setcap_nexttrace() {
+setcap_nexttrace_as_root() {
     # root 下尽量给 nexttrace 设置 capabilities，方便之后普通用户运行。
     # 失败不退出：某些 VPS/容器文件系统不支持 capabilities，root 当前运行仍然可用。
     [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 0
@@ -540,35 +546,48 @@ try_setcap_nexttrace() {
     if setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_CMD" >/dev/null 2>&1; then
         info "已为 nexttrace 设置 capabilities：cap_net_raw,cap_net_admin+eip"
     else
-        warn "无法为 nexttrace 设置 capabilities；如果当前是 root 运行，测试仍可继续。"
+        warn "无法为 nexttrace 设置 capabilities；当前是 root 运行，测试仍可继续。"
     fi
+}
+
+ensure_nexttrace_privileges() {
+    # 仅 Linux 下处理 capabilities；其他系统按工具自身行为处理。
+    [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 0
+    [[ -n "${NEXTTRACE_CMD:-}" && -f "$NEXTTRACE_CMD" ]] || die "nexttrace 路径无效：${NEXTTRACE_CMD:-未设置}"
+
+    if can_use_raw_socket_nexttrace; then
+        return 0
+    fi
+
+    warn "NextTrace 路由追踪需要 raw socket 权限；TCP/UDP 模式也不能绕过该权限要求。"
+    warn "当前不是 root，且 $NEXTTRACE_CMD 未设置 cap_net_raw/cap_net_admin。"
+
+    if command_exists sudo && command_exists setcap; then
+        warn "将尝试通过 sudo 为 nexttrace 设置权限：cap_net_raw,cap_net_admin+eip"
+        if sudo setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_CMD"; then
+            NEXTTRACE_PRIVILEGE_OK=1
+            info "权限设置成功，继续测试。"
+            return 0
+        fi
+    fi
+
+    die "无法获得 NextTrace 所需权限。请改用：curl -fsSL https://raw.githubusercontent.com/shaolonger/networksh/main/besttrace.sh -o /tmp/besttrace.sh && sudo bash /tmp/besttrace.sh；或手动执行：sudo setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_CMD""
 }
 
 resolve_trace_mode() {
     case "$BESTTRACE_TRACE_MODE" in
-        auto|AUTO)
-            if can_use_icmp_mode; then
-                TRACE_MODE_EFFECTIVE="ICMP"
-                TRACE_ARGS=()
-            else
-                TRACE_MODE_EFFECTIVE="TCP:${BESTTRACE_TCP_PORT}"
-                TRACE_ARGS=(--tcp --port "$BESTTRACE_TCP_PORT")
-                warn "当前不是 root，且 nexttrace 未获得 raw socket capabilities；已自动改用 TCP:${BESTTRACE_TCP_PORT} 模式。"
-                warn "如需 ICMP 模式，请用 sudo/root 运行，或执行：sudo setcap cap_net_raw,cap_net_admin+eip \"$NEXTTRACE_CMD\""
-            fi
-            ;;
-        icmp|ICMP)
-            if ! can_use_icmp_mode; then
-                die "ICMP 模式需要 root 或 capabilities。请用 sudo/root 运行，或执行：sudo setcap cap_net_raw,cap_net_admin+eip \"$NEXTTRACE_CMD\""
-            fi
+        auto|AUTO|icmp|ICMP)
+            ensure_nexttrace_privileges
             TRACE_MODE_EFFECTIVE="ICMP"
             TRACE_ARGS=()
             ;;
         tcp|TCP)
+            ensure_nexttrace_privileges
             TRACE_MODE_EFFECTIVE="TCP:${BESTTRACE_TCP_PORT}"
             TRACE_ARGS=(--tcp --port "$BESTTRACE_TCP_PORT")
             ;;
         udp|UDP)
+            ensure_nexttrace_privileges
             TRACE_MODE_EFFECTIVE="UDP:${BESTTRACE_UDP_PORT}"
             TRACE_ARGS=(--udp --port "$BESTTRACE_UDP_PORT")
             ;;
@@ -623,7 +642,7 @@ isp_codes=(
 
 main() {
     ensure_nexttrace
-    try_setcap_nexttrace
+    setcap_nexttrace_as_root
     resolve_trace_mode
     print_banner
 
