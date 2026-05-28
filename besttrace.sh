@@ -5,6 +5,7 @@
 # - 移除 管道执行远程 sh 远程脚本执行
 # - 内置 NextTrace 二进制下载逻辑，仅下载二进制，不执行远程 sh
 # - 使用 mktemp 临时文件、输入校验、HTTPS URL 校验、可选 SHA256 校验
+# - 自动处理 NextTrace 权限：root/capabilities 用 ICMP，普通用户自动降级 TCP
 #
 # 安全模式建议：
 #   1) 已安装 nexttrace：直接运行本脚本，不会下载任何内容。
@@ -49,6 +50,12 @@ NEXTTRACE_SHA256="${NEXTTRACE_SHA256:-}"
 # 可选：禁止自动安装/下载。缺少 nexttrace 时直接退出。
 BESTTRACE_NO_INSTALL="${BESTTRACE_NO_INSTALL:-0}"
 
+# 路由测试协议模式：auto|icmp|tcp|udp。
+# auto：有 root/capabilities 时用 ICMP；否则自动退回 TCP:443，避免普通用户权限失败。
+BESTTRACE_TRACE_MODE="${BESTTRACE_TRACE_MODE:-auto}"
+BESTTRACE_TCP_PORT="${BESTTRACE_TCP_PORT:-443}"
+BESTTRACE_UDP_PORT="${BESTTRACE_UDP_PORT:-33494}"
+
 # 可选：用户指定现有 nexttrace 路径。
 NEXTTRACE_CMD="${NEXTTRACE_BIN:-}"
 
@@ -58,6 +65,8 @@ ROWS_CU=()
 ROWS_CM=()
 ROWS_EDU=()
 ROWS_OTHER=()
+TRACE_ARGS=()
+TRACE_MODE_EFFECTIVE=""
 
 # ---------- 基础工具 ----------
 info() { printf '%b\n' "${GREEN}==>${PLAIN} $*"; }
@@ -503,6 +512,72 @@ is_valid_target() {
     return 1
 }
 
+
+can_use_icmp_mode() {
+    # root 运行时可以直接使用 ICMP。
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        return 0
+    fi
+
+    # 普通用户需要二进制具备 Linux capabilities。
+    if command_exists getcap && [[ -n "${NEXTTRACE_CMD:-}" ]] && [[ -e "$NEXTTRACE_CMD" ]]; then
+        local caps
+        caps="$(getcap "$NEXTTRACE_CMD" 2>/dev/null || true)"
+        [[ "$caps" == *cap_net_raw* && "$caps" == *cap_net_admin* ]] && return 0
+    fi
+
+    return 1
+}
+
+try_setcap_nexttrace() {
+    # root 下尽量给 nexttrace 设置 capabilities，方便之后普通用户运行。
+    # 失败不退出：某些 VPS/容器文件系统不支持 capabilities，root 当前运行仍然可用。
+    [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 0
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || return 0
+    command_exists setcap || return 0
+    [[ -n "${NEXTTRACE_CMD:-}" && -f "$NEXTTRACE_CMD" ]] || return 0
+
+    if setcap cap_net_raw,cap_net_admin+eip "$NEXTTRACE_CMD" >/dev/null 2>&1; then
+        info "已为 nexttrace 设置 capabilities：cap_net_raw,cap_net_admin+eip"
+    else
+        warn "无法为 nexttrace 设置 capabilities；如果当前是 root 运行，测试仍可继续。"
+    fi
+}
+
+resolve_trace_mode() {
+    case "$BESTTRACE_TRACE_MODE" in
+        auto|AUTO)
+            if can_use_icmp_mode; then
+                TRACE_MODE_EFFECTIVE="ICMP"
+                TRACE_ARGS=()
+            else
+                TRACE_MODE_EFFECTIVE="TCP:${BESTTRACE_TCP_PORT}"
+                TRACE_ARGS=(--tcp --port "$BESTTRACE_TCP_PORT")
+                warn "当前不是 root，且 nexttrace 未获得 raw socket capabilities；已自动改用 TCP:${BESTTRACE_TCP_PORT} 模式。"
+                warn "如需 ICMP 模式，请用 sudo/root 运行，或执行：sudo setcap cap_net_raw,cap_net_admin+eip \"$NEXTTRACE_CMD\""
+            fi
+            ;;
+        icmp|ICMP)
+            if ! can_use_icmp_mode; then
+                die "ICMP 模式需要 root 或 capabilities。请用 sudo/root 运行，或执行：sudo setcap cap_net_raw,cap_net_admin+eip \"$NEXTTRACE_CMD\""
+            fi
+            TRACE_MODE_EFFECTIVE="ICMP"
+            TRACE_ARGS=()
+            ;;
+        tcp|TCP)
+            TRACE_MODE_EFFECTIVE="TCP:${BESTTRACE_TCP_PORT}"
+            TRACE_ARGS=(--tcp --port "$BESTTRACE_TCP_PORT")
+            ;;
+        udp|UDP)
+            TRACE_MODE_EFFECTIVE="UDP:${BESTTRACE_UDP_PORT}"
+            TRACE_ARGS=(--udp --port "$BESTTRACE_UDP_PORT")
+            ;;
+        *)
+            die "无效 BESTTRACE_TRACE_MODE：$BESTTRACE_TRACE_MODE，可选 auto|icmp|tcp|udp"
+            ;;
+    esac
+}
+
 run_trace_and_analyze() {
     local target_ip="$1"
     local target_name="$2"
@@ -513,7 +588,7 @@ run_trace_and_analyze() {
 
     echo -e "正在测试: ${GREEN}${target_name}${PLAIN} [${target_ip}]"
 
-    if "$NEXTTRACE_CMD" "$target_ip" -q 1 -M | tee "$log_file"; then
+    if "$NEXTTRACE_CMD" -q 1 -M "${TRACE_ARGS[@]}" "$target_ip" | tee "$log_file"; then
         raw_log="$(cat "$log_file")"
         analyze_route "$raw_log" "$isp_type" "$target_name" "$target_ip"
     else
@@ -548,9 +623,12 @@ isp_codes=(
 
 main() {
     ensure_nexttrace
+    try_setcap_nexttrace
+    resolve_trace_mode
     print_banner
 
     echo -e "nexttrace 路径：${SKYBLUE}${NEXTTRACE_CMD}${PLAIN}"
+    echo -e "测试协议模式：${SKYBLUE}${TRACE_MODE_EFFECTIVE}${PLAIN}"
     echo ""
     echo -e "请选择测试模式："
     echo -e "${GREEN}0.${PLAIN} 测试所有节点 (默认 - 直接回车)"
@@ -584,7 +662,7 @@ main() {
         local log_file
         log_file="$(make_temp_file "${TMPDIR:-/tmp}" "besttrace.custom.log")"
 
-        if "$NEXTTRACE_CMD" "$custom_target" -q 1 -M | tee "$log_file"; then
+        if "$NEXTTRACE_CMD" -q 1 -M "${TRACE_ARGS[@]}" "$custom_target" | tee "$log_file"; then
             raw_log="$(cat "$log_file")"
             detected_isp="$(detect_isp_type "$raw_log")"
             analyze_route "$raw_log" "$detected_isp" "自定义测速点" "$custom_target"
@@ -596,7 +674,7 @@ main() {
     fi
 
     clear || true
-    echo -e "${GREEN}=== 开始测试 (模式: $mode_name) ===${PLAIN}"
+    echo -e "${GREEN}=== 开始测试 (模式: $mode_name / 协议: $TRACE_MODE_EFFECTIVE) ===${PLAIN}"
     next_sep
 
     local len count i target_ip target_name isp_type should_run
