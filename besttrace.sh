@@ -618,7 +618,7 @@ main() {
         esac
 
         if $should_run; then
-            ((count++))
+            ((++count))
             run_trace_and_analyze "$target_ip" "$target_name" "$isp_type"
             next_sep
             sleep 1
